@@ -1078,7 +1078,18 @@ static const struct db_migration dbmigrations[] = {
      /* Need to make sure that withheld isn't used. */
      NULL, revert_withheld_column},
     /* ^v25.12 */
-
+    /* Mempool outputs table for tracking unconfirmed incoming transactions */
+    {SQL("CREATE TABLE mempool_outputs ("
+	 "  prev_out_tx BLOB NOT NULL"
+	 ", prev_out_index INTEGER NOT NULL"
+	 ", value BIGINT NOT NULL"
+	 ", scriptpubkey BLOB NOT NULL"
+	 ", keyindex INTEGER NOT NULL"
+	 ", first_seen BIGINT NOT NULL"
+	 ", PRIMARY KEY (prev_out_tx, prev_out_index));"),
+     NULL,
+     /* Simply drop table on revert. */
+     SQL("DROP TABLE mempool_outputs")},
 };
 
 const struct db_migration *get_db_migrations(size_t *num)

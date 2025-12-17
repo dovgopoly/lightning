@@ -1023,6 +1023,82 @@ static struct command_result *getutxout(struct command *cmd,
 	return command_still_pending(cmd);
 }
 
+/* Process the result of `getrawmempool` - returns array of txids */
+static struct command_result *process_getrawmempool(struct bitcoin_cli *bcli)
+{
+	const jsmntok_t *tokens, *t;
+	struct json_stream *response;
+	size_t i;
+
+	if (*bcli->exitstatus != 0)
+		return command_err_bcli_badjson(bcli, "getrawmempool failed");
+
+	tokens = json_parse_simple(bcli->output, bcli->output, bcli->output_bytes);
+	if (!tokens)
+		return command_err_bcli_badjson(bcli, "cannot parse getrawmempool output");
+
+	response = jsonrpc_stream_success(bcli->cmd);
+	json_array_start(response, "txids");
+	json_for_each_arr(i, t, tokens) {
+		json_add_tok(response, NULL, t, bcli->output);
+	}
+	json_array_end(response);
+
+	return command_finished(bcli->cmd, response);
+}
+
+static struct command_result *getrawmempool(struct command *cmd,
+					    const char *buf,
+					    const jsmntok_t *toks)
+{
+	if (!param(cmd, buf, toks, NULL))
+		return command_param_failed();
+
+	start_bitcoin_cli(NULL, cmd, process_getrawmempool, true,
+			  BITCOIND_LOW_PRIO, NULL,
+			  "getrawmempool", NULL);
+
+	return command_still_pending(cmd);
+}
+
+/* Process the result of `getrawtransaction` - returns raw tx hex */
+static struct command_result *process_getrawtransaction(struct bitcoin_cli *bcli)
+{
+	struct json_stream *response;
+
+	/* If transaction not found, return null */
+	if (*bcli->exitstatus != 0) {
+		response = jsonrpc_stream_success(bcli->cmd);
+		json_add_null(response, "rawtx");
+		return command_finished(bcli->cmd, response);
+	}
+
+	strip_trailing_whitespace(bcli->output, bcli->output_bytes);
+
+	response = jsonrpc_stream_success(bcli->cmd);
+	json_add_string(response, "rawtx", bcli->output);
+
+	return command_finished(bcli->cmd, response);
+}
+
+static struct command_result *getrawtransaction(struct command *cmd,
+						const char *buf,
+						const jsmntok_t *toks)
+{
+	const char *txid;
+
+	if (!param(cmd, buf, toks,
+		   p_req("txid", param_string, &txid),
+		   NULL))
+		return command_param_failed();
+
+	start_bitcoin_cli(NULL, cmd, process_getrawtransaction, true,
+			  BITCOIND_LOW_PRIO, NULL,
+			  "getrawtransaction", txid, NULL);
+
+	return command_still_pending(cmd);
+}
+
 static void bitcoind_failure(struct plugin *p, const char *error_message)
 {
 	const char **cmd = gather_args(bitcoind, NULL, "echo", NULL);
@@ -1164,6 +1240,14 @@ static const struct plugin_command commands[] = {
 	{
 		"getutxout",
 		getutxout
+	},
+	{
+		"getrawmempool",
+		getrawmempool
+	},
+	{
+		"getrawtransaction",
+		getrawtransaction
 	},
 };
 

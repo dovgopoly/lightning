@@ -25,7 +25,8 @@
   "response": {
     "required": [
       "outputs",
-      "channels"
+      "channels",
+      "mempool"
     ],
     "additionalProperties": false,
     "properties": {
@@ -335,6 +336,62 @@
             }
           ]
         }
+      },
+      "mempool": {
+        "type": "array",
+        "description": [
+          "Unconfirmed incoming transactions in the mempool that pay to wallet addresses."
+        ],
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "txid",
+            "output",
+            "amount_msat",
+            "scriptpubkey",
+            "address",
+            "first_seen"
+          ],
+          "properties": {
+            "txid": {
+              "type": "txid",
+              "description": [
+                "The ID of the unconfirmed transaction."
+              ]
+            },
+            "output": {
+              "type": "u32",
+              "description": [
+                "The index within *txid*."
+              ]
+            },
+            "amount_msat": {
+              "type": "msat",
+              "description": [
+                "The amount of the output."
+              ]
+            },
+            "scriptpubkey": {
+              "type": "hex",
+              "description": [
+                "The scriptPubkey of the output."
+              ]
+            },
+            "address": {
+              "type": "string",
+              "description": [
+                "The bitcoin address of the output."
+              ]
+            },
+            "first_seen": {
+              "type": "u64",
+              "description": [
+                "UNIX timestamp when this transaction was first seen in mempool."
+              ]
+            }
+          }
+        }
       }
     }
   },
@@ -422,7 +479,8 @@
             "funding_txid": "txid010030100301003010030100301003010030100301003010030100301003",
             "funding_output": 3
           }
-        ]
+        ],
+        "mempool": []
       }
     }
   ]

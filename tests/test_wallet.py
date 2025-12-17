@@ -2784,3 +2784,68 @@ def test_rescan_missing_utxo(node_factory, bitcoind):
     time.sleep(5)
     assert not l1.daemon.is_in_log("Scanning for missed UTXOs", start=oldstart_l1)
     assert not l3.daemon.is_in_log("Scanning for missed UTXOs", start=oldstart_l3)
+
+
+@unittest.skipIf(TEST_NETWORK != 'regtest', "Test requires regtest")
+def test_listfunds_mempool(node_factory, bitcoind):
+    """Test that listfunds shows unconfirmed mempool transactions.
+
+    This tests the mempool tracking feature (issue #8586) which adds visibility
+    for pending mempool transactions in listfunds output. The feature:
+    - Polls mempool every 30 seconds for new transactions
+    - Tracks unconfirmed outputs that pay to wallet addresses and inserts them in mempool_outputs table
+    - Shows them in listfunds response under 'mempool' array
+    - Removes them from mempool array once confirmed (moved to 'outputs')
+    - Deduplicates to avoid showing same output in both arrays during race conditions
+    """
+    l1 = node_factory.get_node()
+
+    # Initial listfunds should have empty mempool array
+    funds = l1.rpc.listfunds()
+    assert 'mempool' in funds
+    assert len(funds['mempool']) == 0
+
+    # Get a new address
+    addr = l1.rpc.newaddr()['p2tr']
+
+    # Send funds to the address (stays in mempool, not confirmed)
+    txid = bitcoind.rpc.sendtoaddress(addr, 0.01)
+
+    # Wait for mempool poll to pick it up (polls every 30 seconds, but we can
+    # wait for the log message)
+    l1.daemon.wait_for_log(r'Processing \d+ new mempool transactions')
+
+    # Now listfunds should show the output in mempool array
+    funds = l1.rpc.listfunds()
+
+    print(funds)
+
+    assert len(funds['mempool']) == 1
+    mempool_out = funds['mempool'][0]
+    assert mempool_out['txid'] == txid
+    assert mempool_out['amount_msat'] == Millisatoshi(1000000000)
+    assert mempool_out['address'] == addr
+
+    # The output should NOT be in confirmed outputs yet
+    assert not any(o['txid'] == txid for o in funds['outputs'])
+
+    # Generate a block to confirm the transaction
+    bitcoind.generate_block(1)
+
+    # Wait for the block to be processed
+    sync_blockheight(bitcoind, [l1])
+
+    # Now listfunds should show the output in outputs array, not mempool
+    funds = l1.rpc.listfunds()
+
+    print(funds)
+
+    # Should be in confirmed outputs now
+    confirmed = [o for o in funds['outputs'] if o['txid'] == txid]
+    assert len(confirmed) == 1
+    assert confirmed[0]['status'] == 'confirmed'
+    assert confirmed[0]['amount_msat'] == Millisatoshi(1000000000)
+
+    # Should NOT be in mempool anymore (either removed or deduplicated)
+    mempool_with_txid = [m for m in funds['mempool'] if m['txid'] == txid]
+    assert len(mempool_with_txid) == 0

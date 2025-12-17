@@ -425,6 +425,22 @@ static void json_add_utxos(struct json_stream *response,
 		json_add_utxo(response, NULL, wallet, utxos[i]);
 }
 
+static void json_add_mempool_output(struct json_stream *response,
+				    const char *fieldname,
+				    const struct mempool_output *out)
+{
+	json_object_start(response, fieldname);
+	json_add_txid(response, "txid", &out->outpoint.txid);
+	json_add_num(response, "output", out->outpoint.n);
+	json_add_amount_sat_msat(response, "amount_msat", out->value);
+	json_add_hex_talarr(response, "scriptpubkey", out->scriptpubkey);
+	json_add_string(response, "address",
+			encode_scriptpubkey_to_addr(tmpctx, chainparams,
+						    out->scriptpubkey));
+	json_add_u64(response, "first_seen", out->first_seen);
+	json_object_end(response);
+}
+
 static struct command_result *json_listfunds(struct command *cmd,
 					     const char *buffer,
 					     const jsmntok_t *obj UNNEEDED,
@@ -434,6 +450,7 @@ static struct command_result *json_listfunds(struct command *cmd,
 	struct peer *p;
 	struct peer_node_id_map_iter it;
 	struct utxo **utxos;
+	struct mempool_output *mempool_outs;
 	bool *spent;
 
 	if (!param(cmd, buffer, params,
@@ -487,6 +504,13 @@ static struct command_result *json_listfunds(struct command *cmd,
 			json_object_end(response);
 		}
 	}
+	json_array_end(response);
+
+	/* Add unconfirmed mempool outputs */
+	mempool_outs = wallet_get_mempool_outputs(cmd, cmd->ld->wallet);
+	json_array_start(response, "mempool");
+	for (size_t i = 0; i < tal_count(mempool_outs); i++)
+		json_add_mempool_output(response, NULL, &mempool_outs[i]);
 	json_array_end(response);
 
 	return command_success(cmd, response);
