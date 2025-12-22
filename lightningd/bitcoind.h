@@ -159,4 +159,35 @@ void bitcoind_getutxout_(const tal_t *ctx,
 
 void bitcoind_check_commands(struct bitcoind *bitcoind);
 
+void bitcoind_getrawmempool_(const tal_t *ctx,
+			     struct bitcoind *bitcoind,
+			     void (*cb)(struct bitcoind *,
+					const struct bitcoin_txid *,
+					size_t,
+					void *),
+			     void *arg);
+#define bitcoind_getrawmempool(ctx, bitcoind_, cb, arg)			\
+	bitcoind_getrawmempool_((ctx), (bitcoind_),			\
+				typesafe_cb_preargs(void, void *,	\
+						    (cb), (arg),	\
+						    struct bitcoind *,	\
+						    const struct bitcoin_txid *, \
+						    size_t),		\
+				(arg))
+
+void bitcoind_getrawtransaction_(const tal_t *ctx,
+				 struct bitcoind *bitcoind,
+				 const struct bitcoin_txid *txid,
+				 void (*cb)(struct bitcoind *,
+					    const struct bitcoin_tx *,
+					    void *),
+				 void *arg);
+#define bitcoind_getrawtransaction(ctx, bitcoind_, txid_, cb, arg)	\
+	bitcoind_getrawtransaction_((ctx), (bitcoind_), (txid_),	\
+				    typesafe_cb_preargs(void, void *,	\
+							(cb), (arg),	\
+							struct bitcoind *, \
+							const struct bitcoin_tx *), \
+				    (arg))
+
 #endif /* LIGHTNING_LIGHTNINGD_BITCOIND_H */

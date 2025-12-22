@@ -18,9 +18,11 @@
 #include <lightningd/notification.h>
 #include <math.h>
 #include <wallet/txfilter.h>
+#include <wallet/wallet.h>
 
 /* Mutual recursion via timer. */
 static void try_extend_tip(struct chain_topology *topo);
+static void check_mempool(struct chain_topology *topo);
 
 static bool first_update_complete = false;
 
@@ -30,6 +32,14 @@ static void next_topology_timer(struct chain_topology *topo)
 	topo->extend_timer = new_reltimer(topo->ld->timers, topo,
 					  time_from_sec(topo->poll_seconds),
 					  try_extend_tip, topo);
+}
+
+static void next_mempool_timer(struct chain_topology *topo)
+{
+	/* Poll mempool every poll_seconds, same as blocks */
+	topo->mempool_timer = new_reltimer(topo->ld->timers, topo,
+					   time_from_sec(topo->poll_seconds),
+					   check_mempool, topo);
 }
 
 static bool we_broadcast(const struct chain_topology *topo,
@@ -1238,6 +1248,8 @@ struct chain_topology *new_topology(struct lightningd *ld, struct logger *log)
 	topo->rebroadcast_timer = NULL;
 	topo->updatefee_timer = NULL;
 	topo->checkchain_timer = NULL;
+	topo->mempool_timer = NULL;
+	topo->seen_mempool_txids = new_htable(topo, mempool_txid_map);
 	topo->request_ctx = tal(topo, char);
 	list_head_init(topo->sync_waiters);
 
@@ -1560,6 +1572,175 @@ static void fixup_scan(struct chain_topology *topo)
 				     fixup_scan_block, topo);
 }
 
+/* Mempool monitoring for incoming transactions */
+struct mempool_tx_check {
+	struct chain_topology *topo;
+	struct bitcoin_txid *txids;
+	size_t num_txids;
+	size_t current;
+};
+
+static void process_mempool_tx(struct bitcoind *bitcoind,
+			       const struct bitcoin_tx *tx,
+			       struct mempool_tx_check *check);
+
+static void check_next_mempool_tx(struct mempool_tx_check *check)
+{
+	/* If we've processed all transactions, we're done */
+	if (check->current >= check->num_txids) {
+		/* Schedule next mempool check */
+		next_mempool_timer(check->topo);
+		tal_free(check);
+		return;
+	}
+
+	/* Get the next transaction */
+	bitcoind_getrawtransaction(check, check->topo->bitcoind,
+				   &check->txids[check->current],
+				   process_mempool_tx, check);
+}
+
+static void process_mempool_tx(struct bitcoind *bitcoind,
+			       const struct bitcoin_tx *tx,
+			       struct mempool_tx_check *check)
+{
+	struct chain_topology *topo = check->topo;
+
+	if (tx) {
+		struct wallet *wallet = topo->ld->wallet;
+		const struct wally_tx *wtx = tx->wtx;
+
+		/* Check each output to see if it belongs to us */
+		for (size_t i = 0; i < wtx->num_outputs; i++) {
+			const struct wally_tx_output *txout = &wtx->outputs[i];
+			u32 keyindex;
+			enum addrtype addrtype;
+			struct amount_asset asset = wally_tx_output_get_amount(txout);
+			struct bitcoin_outpoint outpoint;
+			struct amount_sat value;
+
+			if (!amount_asset_is_main(&asset))
+				continue;
+
+			if (!wallet_can_spend(wallet, txout->script,
+					      txout->script_len, &keyindex, &addrtype))
+				continue;
+
+			/* This output belongs to us! */
+			outpoint.txid = check->txids[check->current];
+			outpoint.n = i;
+			value = amount_asset_to_sat(&asset);
+
+			log_debug(topo->log, "Found mempool output %s:%zu worth %s",
+				  fmt_bitcoin_txid(tmpctx, &outpoint.txid),
+				  i, fmt_amount_sat(tmpctx, value));
+
+			/* Add to mempool_outputs table */
+			wallet_add_mempool_output(wallet, &outpoint, value,
+						  txout->script, keyindex);
+		}
+	}
+
+	/* Move to next transaction */
+	check->current++;
+	check_next_mempool_tx(check);
+}
+
+static void got_mempool_txids(struct bitcoind *bitcoind,
+			      const struct bitcoin_txid *txids,
+			      size_t num_txids,
+			      struct chain_topology *topo)
+{
+	struct mempool_tx_check *check;
+	struct mempool_txid_map *current_mempool;
+	struct mempool_txid *mt;
+	struct mempool_txid_map_iter iter;
+	struct bitcoin_txid *new_txids;
+	struct mempool_txid **to_delete;
+	size_t i;
+
+	topo->mempool_timer = NULL;
+
+	/* Build a temporary hash set of current mempool txids for fast lookup */
+	current_mempool = new_htable(tmpctx, mempool_txid_map);
+	for (i = 0; i < num_txids; i++) {
+		mt = tal(current_mempool, struct mempool_txid);
+		mt->txid = txids[i];
+		mempool_txid_map_add(current_mempool, mt);
+	}
+
+	/* Find dropped txids: in seen but not in current mempool */
+	/* Collect first, then delete (can't modify during iteration) */
+	to_delete = tal_arr(tmpctx, struct mempool_txid *, 0);
+	for (mt = mempool_txid_map_first(topo->seen_mempool_txids, &iter);
+	     mt;
+	     mt = mempool_txid_map_next(topo->seen_mempool_txids, &iter)) {
+		if (!mempool_txid_map_get(current_mempool, &mt->txid)) {
+			tal_arr_expand(&to_delete, mt);
+		}
+	}
+
+	/* Now delete the dropped txids */
+	for (i = 0; i < tal_count(to_delete); i++) {
+		mt = to_delete[i];
+		log_debug(topo->log, "Mempool tx %s dropped",
+			  fmt_bitcoin_txid(tmpctx, &mt->txid));
+		/* Delete from mempool_outputs DB table */
+		wallet_delete_mempool_outputs_by_txid(topo->ld->wallet, &mt->txid);
+		mempool_txid_map_del(topo->seen_mempool_txids, mt);
+		tal_free(mt);
+	}
+
+	/* Find new txids: in current mempool but not in seen */
+	new_txids = tal_arr(tmpctx, struct bitcoin_txid, 0);
+	for (i = 0; i < num_txids; i++) {
+		if (!mempool_txid_map_get(topo->seen_mempool_txids, &txids[i])) {
+			/* New tx - add to list to process */
+			tal_arr_expand(&new_txids, txids[i]);
+			/* Add to seen */
+			mt = tal(topo->seen_mempool_txids, struct mempool_txid);
+			mt->txid = txids[i];
+			mempool_txid_map_add(topo->seen_mempool_txids, mt);
+		}
+	}
+
+	if (tal_count(new_txids) == 0) {
+		/* No new transactions to process */
+		log_debug(topo->log, "No new mempool transactions (seen %zu)",
+			  mempool_txid_map_count(topo->seen_mempool_txids));
+		next_mempool_timer(topo);
+		return;
+	}
+
+	log_debug(topo->log, "Processing %zu new mempool transactions (seen %zu total)",
+		  tal_count(new_txids),
+		  mempool_txid_map_count(topo->seen_mempool_txids));
+
+	/* Create state for iterating through new transactions only */
+	check = tal(topo, struct mempool_tx_check);
+	check->topo = topo;
+	check->txids = tal_steal(check, new_txids);
+	check->num_txids = tal_count(new_txids);
+	check->current = 0;
+
+	/* Start processing transactions */
+	check_next_mempool_tx(check);
+}
+
+static void check_mempool(struct chain_topology *topo)
+{
+	topo->mempool_timer = NULL;
+
+	/* Don't check mempool until we're synced */
+	if (!topo->bitcoind->synced) {
+		next_mempool_timer(topo);
+		return;
+	}
+
+	/* Get all transaction IDs in the mempool */
+	bitcoind_getrawmempool(topo, topo->bitcoind, got_mempool_txids, topo);
+}
+
 void begin_topology(struct chain_topology *topo)
 {
 	/* If we were not synced, start looping to check */
@@ -1569,6 +1750,8 @@ void begin_topology(struct chain_topology *topo)
 	start_fee_estimate(topo);
 	/* Regular block updates */
 	try_extend_tip(topo);
+	/* Regular mempool monitoring for incoming transactions */
+	check_mempool(topo);
 
 	if (topo->old_block_scan)
 		fixup_scan(topo);
@@ -1580,6 +1763,7 @@ void stop_topology(struct chain_topology *topo)
 	tal_free(topo->checkchain_timer);
 	tal_free(topo->extend_timer);
 	tal_free(topo->updatefee_timer);
+	tal_free(topo->mempool_timer);
 
 	/* Don't handle responses to any existing requests. */
 	tal_free(topo->request_ctx);
