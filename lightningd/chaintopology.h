@@ -96,6 +96,31 @@ struct feerate_est {
 	u32 rate;
 };
 
+/* Hash set for tracking seen mempool txids */
+struct mempool_txid {
+	struct bitcoin_txid txid;
+};
+
+static inline const struct bitcoin_txid *mempool_txid_keyof(const struct mempool_txid *mt)
+{
+	return &mt->txid;
+}
+
+static inline size_t mempool_txid_hash(const struct bitcoin_txid *txid)
+{
+	size_t ret;
+	memcpy(&ret, txid, sizeof(ret));
+	return ret;
+}
+
+static inline bool mempool_txid_eq(const struct mempool_txid *mt, const struct bitcoin_txid *txid)
+{
+	return bitcoin_txid_eq(&mt->txid, txid);
+}
+
+HTABLE_DEFINE_NODUPS_TYPE(struct mempool_txid, mempool_txid_keyof, mempool_txid_hash,
+			  mempool_txid_eq, mempool_txid_map);
+
 struct chain_topology {
 	struct lightningd *ld;
 	struct block *root;
@@ -128,7 +153,7 @@ struct chain_topology {
 	struct bitcoind *bitcoind;
 
 	/* Timers we're running. */
-	struct oneshot *checkchain_timer, *extend_timer, *updatefee_timer, *rebroadcast_timer;
+	struct oneshot *checkchain_timer, *extend_timer, *updatefee_timer, *rebroadcast_timer, *mempool_timer;
 
 	/* Parent context for requests (to bcli plugin) we have outstanding. */
 	tal_t *request_ctx;
@@ -146,6 +171,9 @@ struct chain_topology {
 
 	/* Progress on routine to look for old missed transactions.  0 = not interested. */
 	u32 old_block_scan;
+
+	/* Seen mempool txids - for tracking which txs we've already processed */
+	struct mempool_txid_map *seen_mempool_txids;
 };
 
 /* Information relevant to locating a TX in a blockchain. */

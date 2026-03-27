@@ -2017,4 +2017,45 @@ void wallet_datastore_save_payment_description(struct db *db,
 					       const char *desc);
 void migrate_setup_coinmoves(struct lightningd *ld, struct db *db);
 
+/**
+ * Mempool output functions - for tracking unconfirmed incoming transactions
+ */
+
+/* A mempool output we're tracking */
+struct mempool_output {
+	struct bitcoin_outpoint outpoint;
+	struct amount_sat value;
+	u8 *scriptpubkey;
+	u32 keyindex;
+	u64 first_seen;
+};
+
+/**
+ * wallet_add_mempool_output - add a mempool output to the database
+ *
+ * Returns true if inserted (or already exists), false on error.
+ */
+bool wallet_add_mempool_output(struct wallet *w,
+			       const struct bitcoin_outpoint *outpoint,
+			       struct amount_sat value,
+			       const u8 *scriptpubkey,
+			       u32 keyindex);
+
+/**
+ * wallet_delete_mempool_outputs_by_txid - delete all mempool outputs for a txid
+ *
+ * Called when a transaction is no longer in the mempool (confirmed or dropped).
+ */
+void wallet_delete_mempool_outputs_by_txid(struct wallet *w,
+					   const struct bitcoin_txid *txid);
+
+/**
+ * wallet_get_mempool_outputs - get all mempool outputs
+ *
+ * Returns an array of mempool outputs, excluding any that are already
+ * confirmed in the outputs table (deduplication).
+ */
+struct mempool_output *wallet_get_mempool_outputs(const tal_t *ctx,
+						  struct wallet *w);
+
 #endif /* LIGHTNING_WALLET_WALLET_H */

@@ -683,6 +683,181 @@ void bitcoind_getutxout_(const tal_t *ctx,
 	bitcoin_plugin_send(bitcoind, req);
 }
 
+/* Mempool calls for tracking unconfirmed incoming transactions */
+struct getrawmempool_call {
+	struct bitcoind *bitcoind;
+	void (*cb)(struct bitcoind *bitcoind,
+		   const struct bitcoin_txid *txids,
+		   size_t num_txids,
+		   void *arg);
+	void *cb_arg;
+};
+
+static void getrawmempool_callback(const char *buf, const jsmntok_t *toks,
+				   const jsmntok_t *idtok,
+				   struct getrawmempool_call *call)
+{
+	const jsmntok_t *result, *txids_tok, *t;
+	struct bitcoin_txid *txids;
+	size_t i;
+
+	/* Whatever happens, we want to free this. */
+	tal_steal(tmpctx, call);
+
+	result = json_get_member(buf, toks, "result");
+	if (!result) {
+		bitcoin_plugin_error(call->bitcoind, buf, toks, "getrawmempool",
+				     "no 'result' field");
+		return;
+	}
+
+	/* The bcli response wraps txids in a "txids" field */
+	txids_tok = json_get_member(buf, result, "txids");
+	if (!txids_tok) {
+		bitcoin_plugin_error(call->bitcoind, buf, toks, "getrawmempool",
+				     "no 'txids' field in result");
+		return;
+	}
+
+	txids = tal_arr(tmpctx, struct bitcoin_txid, 0);
+	json_for_each_arr(i, t, txids_tok) {
+		struct bitcoin_txid txid;
+		if (!json_to_txid(buf, t, &txid)) {
+			bitcoin_plugin_error(call->bitcoind, buf, toks, "getrawmempool",
+					     "bad txid in array");
+			return;
+		}
+		tal_arr_expand(&txids, txid);
+	}
+
+	call->cb(call->bitcoind, txids, tal_count(txids), call->cb_arg);
+}
+
+void bitcoind_getrawmempool_(const tal_t *ctx,
+			     struct bitcoind *bitcoind,
+			     void (*cb)(struct bitcoind *,
+					const struct bitcoin_txid *,
+					size_t,
+					void *),
+			     void *cb_arg)
+{
+	struct jsonrpc_request *req;
+	struct getrawmempool_call *call;
+	struct plugin *plugin;
+
+	/* Check if the plugin provides getrawmempool (it's optional) */
+	plugin = strmap_get(&bitcoind->pluginsmap, "getrawmempool");
+	if (!plugin) {
+		plugin = find_plugin_for_command(bitcoind->ld, "getrawmempool");
+		if (!plugin) {
+			/* No plugin provides getrawmempool, return empty */
+			cb(bitcoind, NULL, 0, cb_arg);
+			return;
+		}
+		/* Register it for future calls */
+		strmap_add(&bitcoind->pluginsmap, "getrawmempool", plugin);
+	}
+
+	call = tal(ctx, struct getrawmempool_call);
+	call->bitcoind = bitcoind;
+	call->cb = cb;
+	call->cb_arg = cb_arg;
+
+	req = jsonrpc_request_start(call, "getrawmempool", NULL,
+				    bitcoind->log,
+				    NULL, getrawmempool_callback, call);
+	jsonrpc_request_end(req);
+	bitcoin_plugin_send(bitcoind, req);
+}
+
+struct getrawtransaction_call {
+	struct bitcoind *bitcoind;
+	void (*cb)(struct bitcoind *bitcoind,
+		   const struct bitcoin_tx *tx,
+		   void *arg);
+	void *cb_arg;
+};
+
+static void getrawtransaction_callback(const char *buf, const jsmntok_t *toks,
+				       const jsmntok_t *idtok,
+				       struct getrawtransaction_call *call)
+{
+	const jsmntok_t *result, *rawtx_tok;
+	struct bitcoin_tx *tx;
+
+	/* Whatever happens, we want to free this. */
+	tal_steal(tmpctx, call);
+
+	result = json_get_member(buf, toks, "result");
+	if (!result) {
+		bitcoin_plugin_error(call->bitcoind, buf, toks, "getrawtransaction",
+				     "no 'result' field");
+		return;
+	}
+
+	/* The bcli response wraps the hex in a "rawtx" field */
+	rawtx_tok = json_get_member(buf, result, "rawtx");
+	if (!rawtx_tok) {
+		/* Transaction not found */
+		call->cb(call->bitcoind, NULL, call->cb_arg);
+		return;
+	}
+
+	if (json_tok_is_null(buf, rawtx_tok)) {
+		/* Transaction not found */
+		call->cb(call->bitcoind, NULL, call->cb_arg);
+		return;
+	}
+
+	tx = bitcoin_tx_from_hex(tmpctx, buf + rawtx_tok->start,
+				 rawtx_tok->end - rawtx_tok->start);
+	if (!tx) {
+		bitcoin_plugin_error(call->bitcoind, buf, toks, "getrawtransaction",
+				     "failed to parse tx");
+		return;
+	}
+
+	call->cb(call->bitcoind, tx, call->cb_arg);
+}
+
+void bitcoind_getrawtransaction_(const tal_t *ctx,
+				 struct bitcoind *bitcoind,
+				 const struct bitcoin_txid *txid,
+				 void (*cb)(struct bitcoind *,
+					    const struct bitcoin_tx *,
+					    void *),
+				 void *cb_arg)
+{
+	struct jsonrpc_request *req;
+	struct getrawtransaction_call *call;
+	struct plugin *plugin;
+
+	/* Check if the plugin provides getrawtransaction (it's optional) */
+	plugin = strmap_get(&bitcoind->pluginsmap, "getrawtransaction");
+	if (!plugin) {
+		plugin = find_plugin_for_command(bitcoind->ld, "getrawtransaction");
+		if (!plugin) {
+			/* No plugin provides getrawtransaction, return NULL */
+			cb(bitcoind, NULL, cb_arg);
+			return;
+		}
+		/* Register it for future calls */
+		strmap_add(&bitcoind->pluginsmap, "getrawtransaction", plugin);
+	}
+
+	call = tal(ctx, struct getrawtransaction_call);
+	call->bitcoind = bitcoind;
+	call->cb = cb;
+	call->cb_arg = cb_arg;
+
+	req = jsonrpc_request_start(call, "getrawtransaction", NULL,
+				    bitcoind->log,
+				    NULL, getrawtransaction_callback, call);
+	json_add_txid(req->stream, "txid", txid);
+	jsonrpc_request_end(req);
+	bitcoin_plugin_send(bitcoind, req);
+}
+
 /* Context for the getfilteredblock call. Wraps the actual arguments while we
  * process the various steps. */
 struct filteredblock_call {

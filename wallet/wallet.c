@@ -7941,3 +7941,88 @@ void migrate_remove_chain_moves_duplicates(struct lightningd *ld, struct db *db)
 		db_exec_prepared_v2(take(stmt));
 	}
 }
+
+/* Mempool output functions */
+bool wallet_add_mempool_output(struct wallet *w,
+			       const struct bitcoin_outpoint *outpoint,
+			       struct amount_sat value,
+			       const u8 *scriptpubkey,
+			       u32 keyindex)
+{
+	struct db_stmt *stmt;
+
+	/* Use INSERT OR IGNORE to handle duplicates gracefully */
+	stmt = db_prepare_v2(w->db,
+			     SQL("INSERT OR IGNORE INTO mempool_outputs ("
+				 "  prev_out_tx"
+				 ", prev_out_index"
+				 ", value"
+				 ", scriptpubkey"
+				 ", keyindex"
+				 ", first_seen"
+				 ") VALUES (?, ?, ?, ?, ?, ?);"));
+
+	db_bind_txid(stmt, &outpoint->txid);
+	db_bind_int(stmt, outpoint->n);
+	db_bind_amount_sat(stmt, value);
+	db_bind_talarr(stmt, scriptpubkey);
+	db_bind_int(stmt, keyindex);
+	db_bind_u64(stmt, time_now().ts.tv_sec);
+	db_exec_prepared_v2(take(stmt));
+
+	return true;
+}
+
+void wallet_delete_mempool_outputs_by_txid(struct wallet *w,
+					   const struct bitcoin_txid *txid)
+{
+	struct db_stmt *stmt;
+
+	stmt = db_prepare_v2(w->db,
+			     SQL("DELETE FROM mempool_outputs"
+				 " WHERE prev_out_tx = ?;"));
+	db_bind_txid(stmt, txid);
+	db_exec_prepared_v2(take(stmt));
+}
+
+struct mempool_output *wallet_get_mempool_outputs(const tal_t *ctx,
+						  struct wallet *w)
+{
+	struct db_stmt *stmt;
+	struct mempool_output *outputs;
+
+	outputs = tal_arr(ctx, struct mempool_output, 0);
+
+	/* Get mempool outputs that are NOT already in the confirmed outputs table */
+	stmt = db_prepare_v2(w->db,
+			     SQL("SELECT m.prev_out_tx"
+				 ", m.prev_out_index"
+				 ", m.value"
+				 ", m.scriptpubkey"
+				 ", m.keyindex"
+				 ", m.first_seen"
+				 " FROM mempool_outputs m"
+				 " WHERE NOT EXISTS ("
+				 "   SELECT 1 FROM outputs o"
+				 "   WHERE o.prev_out_tx = m.prev_out_tx"
+				 "   AND o.prev_out_index = m.prev_out_index"
+				 ");"));
+
+	db_query_prepared(stmt);
+
+	while (db_step(stmt)) {
+		struct mempool_output out;
+
+		db_col_txid(stmt, "m.prev_out_tx", &out.outpoint.txid);
+		out.outpoint.n = db_col_int(stmt, "m.prev_out_index");
+		out.value = db_col_amount_sat(stmt, "m.value");
+		out.scriptpubkey = db_col_arr(outputs, stmt, "m.scriptpubkey", u8);
+		out.keyindex = db_col_int(stmt, "m.keyindex");
+		out.first_seen = db_col_u64(stmt, "m.first_seen");
+
+		tal_arr_expand(&outputs, out);
+	}
+	tal_free(stmt);
+
+	return outputs;
+}
